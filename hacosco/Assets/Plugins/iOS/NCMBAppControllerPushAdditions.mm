@@ -1,5 +1,5 @@
 /*******
- Copyright 2017 FUJITSU CLOUD TECHNOLOGIES LIMITED All Rights Reserved.
+ Copyright 2017-2020 FUJITSU CLOUD TECHNOLOGIES LIMITED All Rights Reserved.
  
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -49,9 +49,13 @@
 #include "PluginBase/AppDelegateListener.h"
 
 // For Push
-#import <NCMB/NCMB.h>
+#include "NCMBRichPushView.h"
 #include <stdio.h>
+#if __has_include(<UserNotifications/UserNotifications.h>)
+#import  <UserNotifications/UserNotifications.h>
+#endif
 
+#define MAX_PUSH_DELAY_COUNT 20
 // Converts C style string to NSString
 #define GetStringParam( _x_ ) ( _x_ != NULL ) ? [NSString stringWithUTF8String:_x_] : [NSString stringWithUTF8String:""]
 
@@ -61,6 +65,13 @@ void UnitySendDeviceToken( NSData* deviceToken );
 void UnitySendRemoteNotification( NSDictionary* notification );
 void UnitySendRemoteNotificationError( NSError* error );
 void UnitySendLocalNotification( UILocalNotification* notification );
+
+// Notify & Log methods
+void notifyUnityWithClassName(const char * objectName, const char * method, const char * message)
+{
+    UnitySendMessage(objectName, method, message);
+    //NSLog(@"[NCMB] %s : %s", method, message);
+}
 
 // Notify & Log methods
 void notifyUnity(const char * method, const char * message)
@@ -76,90 +87,68 @@ void notifyUnityError(const char * method, NSError * error)
     //NSLog(@"[NCMB] %s : %s", method, message);
 }
 
+#pragma mark - C#から呼び出し
+extern bool _unityAppReady;
+
 // Native code
 extern "C"
 {
+    
     // Use location or not
     bool getLocation;
     bool useAnalytics;
     
-    
     // Save launch options for using later (after set key)
     NSDictionary * savedLaunchOptions;
     
-    void afterLaunch()
-    {
-        // NCMB Track
-        [NCMBAnalytics trackAppOpenedWithLaunchOptions:savedLaunchOptions];
-        
-        // NCMB Handle Rich Push
-        [NCMBPush handleRichPush:[savedLaunchOptions objectForKey:@"UIApplicationLaunchOptionsRemoteNotificationKey"]];
-    }
-    
-    void saveInstallation(NCMBInstallation * currentInstallation)
-    {
-        [currentInstallation saveInBackgroundWithBlock:^(NSError *error) {
-            if(!error){
-                //端末情報の登録が成功した場合の処理
-                notifyUnity("OnRegistration", "");
-                
-                afterLaunch();
-            } else {
-                //端末情報の登録が失敗した場合の処理
-                if (error.code == 409001){
-                    //失敗理由がdeviceTokenの重複だった場合は、登録された端末情報を取得する
-                    NCMBQuery *installationQuery = [NCMBInstallation query];
-                    [installationQuery whereKey:@"deviceToken" equalTo:currentInstallation.deviceToken];
-                    
-                    NSError *searchErr = nil;
-                    NCMBInstallation *searchDevice = (NCMBInstallation*)[installationQuery getFirstObject:&searchErr];
-                    
-                    if (!searchErr){
-                        //上書き保存する
-                        currentInstallation.objectId = searchDevice.objectId;
-                        [currentInstallation saveInBackgroundWithBlock:^(NSError *updateError) {
-                            if (updateError){
-                                //端末情報更新に失敗したときの処理
-                                notifyUnityError("OnRegistration", updateError);
-                            } else {
-                                //端末情報更新に成功したときの処理
-                                notifyUnity("OnRegistration", "");
-                                
-                                afterLaunch();
-                            }
-                        }];
-                    } else {
-                        notifyUnity("OnRegistration", "Can't get first object from Installation Class.");
-                    }
-                } else {
-                    notifyUnityError("OnRegistration", error);
-                }
-            }
-        }];
-    }
-    
-    void initialize(const char * applicationKey, const char * clientKey)
-    {
-        [NCMB setApplicationKey:GetStringParam(applicationKey) clientKey:GetStringParam(clientKey)];
-    }
-    
     void registerCommon()
     {
-        if (NSFoundationVersionNumber > NSFoundationVersionNumber_iOS_7_1){
-            UIUserNotificationType type = UIRemoteNotificationTypeAlert |
-            UIRemoteNotificationTypeBadge |
-            UIRemoteNotificationTypeSound;
-            UIUserNotificationSettings *setting = [UIUserNotificationSettings settingsForTypes:type
-                                                                                    categories:nil];
+        if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){8, 0, 0}]){
+            
+            //iOS10未満での、DeviceToken要求方法
+            
+            //通知のタイプを設定したsettingを用意
+            UIUserNotificationType type = UIUserNotificationTypeAlert |
+            UIUserNotificationTypeBadge |
+            UIUserNotificationTypeSound;
+            UIUserNotificationSettings *setting;
+            setting = [UIUserNotificationSettings settingsForTypes:type
+                                                        categories:nil];
+            
+            //通知のタイプを設定
             [[UIApplication sharedApplication] registerUserNotificationSettings:setting];
+            
+            //DeviceTokenを要求
             [[UIApplication sharedApplication] registerForRemoteNotifications];
         } else {
+            
+            //iOS8未満での、DeviceToken要求方法
             [[UIApplication sharedApplication] registerForRemoteNotificationTypes:
              (UIRemoteNotificationTypeAlert |
               UIRemoteNotificationTypeBadge |
               UIRemoteNotificationTypeSound)];
         }
         
+        #if __has_include(<UserNotifications/UserNotifications.h>)
+        if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){10, 0, 0}]){
+            
+            //iOS10以上での、DeviceToken要求方法
+            UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert |
+                                                     UNAuthorizationOptionBadge |
+                                                     UNAuthorizationOptionSound)
+                                  completionHandler:^(BOOL granted, NSError * _Nullable error) {
+                                      if (error) {
+                                          return;
+                                      }
+                                      if (granted) {
+                                          //通知を許可にした場合DeviceTokenを要求
+                                          [[UIApplication sharedApplication] registerForRemoteNotifications];
+                                      }
+                                  }];
+            
+        }
+        #endif
     }
     
     void registerNotification(BOOL _useAnalytics)
@@ -175,101 +164,64 @@ extern "C"
         registerCommon();
     }
     
-    void settingPush(NSMutableDictionary *data, NCMBPush *push ,int delayByMilliseconds,bool dialog)
-    {
-        //iOS Set Sound
-        //NSArray *target = [data objectForKey:@"target"];
-        //if([target indexOfObject:@"ios"] != NSNotFound || target.count == 2 || target == nil){
-        //    data[@"sound"] = @"default";
-        //}
-        if (dialog) {
-            [push setDialog:dialog];
-        }
-        
-        //BadgeIncrementFlag
-        if([data objectForKey:@"badgeIncrementFlag"]){
-            if ([[data objectForKey:@"badgeIncrementFlag"] isEqual:@0])
-            {
-                [push setBadgeIncrementFlag:NO];
-            }else{
-                [push setBadgeIncrementFlag:YES];
-            }
-            [data removeObjectForKey:@"badgeIncrementFlag"];
-        }
-        
-        //contentAvailable
-        if([data objectForKey:@"contentAvailable"]){
-            if ([[data objectForKey:@"contentAvailable"] isEqual:@0])
-            {
-                [push setContentAvailable:NO];
-            }else{
-                [push setContentAvailable:YES];
-            }
-            [data removeObjectForKey:@"contentAvailable"];
-        }
-        
-        // Set Delivery Time
-        if([data objectForKey:@"DeliveryDate"]){
-            NSString *str = [data objectForKey:@"DeliveryDate"];
-            NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-            [formatter setLocale:[NSLocale currentLocale]];
-            [formatter setDateFormat:@"MM/dd/yyyy HH:mm:ss"];
-            NSDate *date = [formatter dateFromString:str];
-            [push setDeliveryTime:date];
-            [data removeObjectForKey:@"DeliveryDate"];
-        }
-        else if (delayByMilliseconds == 0)
-        {
-            [push setImmediateDeliveryFlag:true];
-        }
-        else
-        {
-            [push setDeliveryTime:[NSDate dateWithTimeIntervalSinceNow:((double)delayByMilliseconds / 1000)]];
-        }
-        
-    }
-    
-    void sendPush(const char * json, const char * message, int delayByMilliseconds,bool dialog)
-    {
-        NCMBPush *push = [NCMBPush push];
-        
-        // Json to Dictionary
-        NSString *nsJson = GetStringParam(json);
-        
-        // Data
-        NSError *error = nil;
-        NSData *jsonData = [nsJson dataUsingEncoding:NSUTF8StringEncoding];
-        NSMutableDictionary *data = [NSJSONSerialization JSONObjectWithData:jsonData options:NSJSONReadingMutableContainers error:&error];
-        
-        //Set Push Data
-        settingPush(data, push, delayByMilliseconds,dialog);
-        
-        [push setData:data];
-        [push setMessage:GetStringParam(message)];
-        
-        // Send
-        [push sendPushInBackgroundWithBlock:^(NSError *error) {
-            if (error)
-            {
-                notifyUnityError("OnSendPush", error);
-            }
-            else
-            {
-                notifyUnity("OnSendPush", "");
-            }
-        }];
-    }
-    
     void clearAll()
     {
         [[UIApplication sharedApplication] setApplicationIconBadgeNumber: 0];
     }
     
-    NSString* currentInstallation(){
-        NCMBInstallation *currentInstallation = [NCMBInstallation currentInstallation];
-        NSString *obj = currentInstallation.objectId;
-        return obj;
+    // installationのプロパティを生成して返却
+    char* getInstallationProperty()
+    {
+        //プロパティを生成
+        NSMutableDictionary *dic = [NSMutableDictionary dictionary];
+        [dic setObject:[[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleName"] forKey:@"applicationName"];
+        [dic setObject:[[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleVersion"] forKey:@"appVersion"];
+        [dic setObject:@"ios" forKey:@"deviceType"];
+        [dic setObject:[[NSTimeZone systemTimeZone] name] forKey:@"timeZone"];
+        //JSON文字列に変換
+        NSData* data=[NSJSONSerialization dataWithJSONObject:dic options:2 error:nil];
+        NSString* jsonstr=[[NSString alloc]initWithData:data encoding:NSUTF8StringEncoding];
+        char* res = (char*)malloc(strlen([jsonstr UTF8String]) + 1);
+        strcpy(res, [jsonstr UTF8String]);
+        return res;
     }
+    
+    void NCMBPushHandle(NSDictionary *userInfo)
+    {
+        // NCMB Handle Rich Push
+        if ([userInfo.allKeys containsObject:@"com.nifcloud.mbaas.RichUrl"])
+        {
+            [NCMBRichPushView handleRichPush:userInfo];
+        }
+        
+        // NCMB Handle Analytics
+        if ([userInfo.allKeys containsObject:@"com.nifcloud.mbaas.PushId"])
+        {
+            if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateActive)
+            {
+                NSString * pushId = [userInfo objectForKey:@"com.nifcloud.mbaas.PushId"];
+                const char *pushIdConstChar = [pushId UTF8String];
+                notifyUnityWithClassName("NCMBManager","onAnalyticsReceived",pushIdConstChar);
+            }
+        }
+        
+        if([userInfo objectForKey:@"aps"]){
+            NSMutableDictionary *beforeUserInfo = [NSMutableDictionary dictionaryWithDictionary:userInfo];
+            NSMutableDictionary *aps = [NSMutableDictionary dictionaryWithDictionary:[userInfo objectForKey:@"aps"]];
+            [beforeUserInfo setObject:aps forKey:@"aps"];
+            if([[aps objectForKey:@"alert"] objectForKey:@"title"]){
+                [beforeUserInfo setObject:[[aps objectForKey:@"alert"] objectForKey:@"title"] forKey:@"com.nifcloud.mbaas.Title"]; //Titleを追加
+            }
+            if([[aps objectForKey:@"alert"] objectForKey:@"body"]){
+                [beforeUserInfo setObject:[[aps objectForKey:@"alert"] objectForKey:@"body"] forKey:@"com.nifcloud.mbaas.Message"]; //Messageを追加
+            }
+            userInfo = (NSMutableDictionary *)beforeUserInfo;
+        }
+        
+        AppController_SendNotificationWithArg(kUnityDidReceiveRemoteNotification, userInfo);
+        UnitySendRemoteNotification(userInfo);//userInfoの値にNullは許容しない
+    }
+    
 }
 
 // Implementation
@@ -281,6 +233,7 @@ extern "C"
 
 @implementation UnityAppController(PushAdditions)
 
+NSInteger pushDelayCount = 0;
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -328,113 +281,74 @@ extern "C"
 
 - (void)application:(UIApplication *)application didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken
 {
-    if (getLocation)
-    {
-        //iOS8の場合、位置情報の利用をリクエストする
-        //別途Info.plistの編集も必要なので、SDKガイドの位置情報検索をご覧ください。
-        if ([[[UIDevice currentDevice] systemVersion] floatValue] >= 8.0){
-            CLLocationManager *locationManager = [[CLLocationManager alloc] init];
-            [locationManager requestWhenInUseAuthorization];
+    //deviceTokenをNSData *からconst char *へ変換します
+    if ([deviceToken isKindOfClass:[NSData class]] && [deviceToken length] != 0){
+        unsigned char *dataBuffer = (unsigned char*)deviceToken.bytes;
+        NSMutableString *tokenId = [NSMutableString stringWithCapacity:(deviceToken.length * 2)];
+        for (int i = 0; i < deviceToken.length; ++i) {
+            [tokenId appendFormat:@"%02x", dataBuffer[i]];
         }
-        
-        //現在地を非同期処理で取得する
-        [NCMBGeoPoint geoPointForCurrentLocationInBackground:^(NCMBGeoPoint *geoPoint, NSError *error) {
-            if (error){
-                //位置情報取得に失敗したエラー処理
-                notifyUnityError("OnGetLocationFailed", error);
-            } else {
-                char sgeo[256];
-                sprintf(sgeo, "%lf %lf", geoPoint.latitude, geoPoint.longitude);
-                
-                notifyUnity("OnGetLocationSucceeded", sgeo);
-                
-                //位置情報が取得できた場合の処理
-                NCMBInstallation *installation = [NCMBInstallation currentInstallation];
-                [installation setDeviceTokenFromData:deviceToken];
-                [installation setObject:geoPoint forKey:@"geoPoint"];
-                [installation setObject:[[UIDevice currentDevice] systemVersion] forKey:@"osVersion"];
-                
-                saveInstallation(installation);
-            }
-        }];
+        const char * deviceTokenConstChar = [tokenId UTF8String];
+        //Unityへデバイストークンを送り、UnityからmBaaS backendのinstallationクラスへ保存します
+        notifyUnityWithClassName("NCMBManager", "onTokenReceived", deviceTokenConstChar);
+    } else {
+        NSLog(@"[NCMB]: 不正なデバイストークのため、端末登録を行いません");
     }
-    else
-    {
-        NCMBInstallation *installation = [NCMBInstallation currentInstallation];
-        [installation setDeviceTokenFromData:deviceToken];
-        [installation setObject:[[UIDevice currentDevice] systemVersion] forKey:@"osVersion"];
-        
-        saveInstallation(installation);
-    }
-    
 }
 
 - (void)application:(UIApplication*)application didFailToRegisterForRemoteNotificationsWithError:(NSError*)error
 {
     UnitySendRemoteNotificationError( error );
     
-    notifyUnityError("OnRemoteRegistrationDidFail", error);
+    notifyUnityError("OnRegistration", error);
 }
 
-//contentAvailableがfalseの時に実行される
 - (void)application:(UIApplication*)application didReceiveRemoteNotification:(NSDictionary*)userInfo
 {
-    if([userInfo objectForKey:@"aps"]){
-        if ([[(NSDictionary *)[userInfo objectForKey:@"aps"] objectForKey:@"sound"] isEqual:[NSNull null]]) {
-            NSMutableDictionary *beforeUserInfo = [NSMutableDictionary dictionaryWithDictionary:userInfo];
-            NSMutableDictionary *aps = [NSMutableDictionary dictionaryWithDictionary:[userInfo objectForKey:@"aps"]];
-            [aps removeObjectForKey:@"sound"];
-            [beforeUserInfo setObject:aps forKey:@"aps"];
-            userInfo = (NSMutableDictionary *)beforeUserInfo;
-        }
-    }
-    
-    AppController_SendNotificationWithArg(kUnityDidReceiveRemoteNotification, userInfo);
-    UnitySendRemoteNotification(userInfo);//userInfoの値にNullは許容しない
-    
-    // NCMB Handle Rich Push
-    if ([userInfo.allKeys containsObject:@"com.nifty.RichUrl"])
-    {
-        if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateActive)
-        {
-            [NCMBPush handleRichPush:userInfo];
-        }
-    }
-    
-    if(useAnalytics){
-        [NCMBAnalytics trackAppOpenedWithRemoteNotificationPayload:userInfo];
-    }
+    [self handleRichPushIfReady:userInfo];
 }
 
-//contentAvailableがtrueの時に実行される
-- (void)application:(UIApplication*)application didReceiveRemoteNotification:(NSDictionary*)userInfo fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler
+- (void)application:(UIApplication *)application didReceiveRemoteNotification:(NSDictionary *)userInfo fetchCompletionHandler:(void (^)(UIBackgroundFetchResult result))handler
 {
-    if([userInfo objectForKey:@"aps"]){
-        if ([[(NSDictionary *)[userInfo objectForKey:@"aps"] objectForKey:@"sound"] isEqual:[NSNull null]]) {
-            NSMutableDictionary *beforeUserInfo = [NSMutableDictionary dictionaryWithDictionary:userInfo];
-            NSMutableDictionary *aps = [NSMutableDictionary dictionaryWithDictionary:[userInfo objectForKey:@"aps"]];
-            [aps removeObjectForKey:@"sound"];
-            [beforeUserInfo setObject:(NSDictionary *)aps forKey:@"aps"];
-            userInfo = (NSDictionary *)beforeUserInfo;
-        }
-    }
-    
-    AppController_SendNotificationWithArg(kUnityDidReceiveRemoteNotification, userInfo);
-    UnitySendRemoteNotification(userInfo);//userInfoの値にNullは許容しない
-    
-    // NCMB Handle Rich Push
-    if ([userInfo.allKeys containsObject:@"com.nifty.RichUrl"])
+    [self handleRichPushIfReady:userInfo];
+    if (handler)
     {
-        if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateActive)
-        {
-            [NCMBPush handleRichPush:userInfo];
-        }
-    }
-    
-    if(useAnalytics){
-        [NCMBAnalytics trackAppOpenedWithRemoteNotificationPayload:userInfo];
+        handler(UIBackgroundFetchResultNoData);
     }
 }
 
+-(void)handleRichPushIfReady:(NSDictionary*)userInfo
+{
+    //Limit to avoid infinite loop
+    if(pushDelayCount < MAX_PUSH_DELAY_COUNT){
+        if(_unityAppReady){
+            //Remove null values (<null>) to avoid crash
+            NSDictionary *notificationInfo = [self removeNullObjects:userInfo];
+            NCMBPushHandle(notificationInfo);
+            pushDelayCount = 0;
+        } else {
+            pushDelayCount++;
+            //Delay for 100 miliseconds
+            [self performSelector:@selector(handleRichPushIfReady:) withObject:userInfo afterDelay:0.1];
+        }
+    }
+}
+
+-(NSDictionary*) removeNullObjects:(NSDictionary*) dictionary {
+    NSMutableDictionary *dict = [dictionary mutableCopy];
+    NSArray *keysForNullValues = [dict allKeysForObject:[NSNull null]];
+    [dict removeObjectsForKeys:keysForNullValues];
+    for(NSString *key in dict.allKeys){
+        if ([[dict valueForKey:key] isKindOfClass:[NSDictionary class]]){
+            NSDictionary *childDict = [self removeNullObjects:[dict valueForKey:key]];
+            if([childDict allKeys].count > 0){
+                [dict setObject:childDict forKey:key];
+            } else {
+                [dict removeObjectForKey:key];
+            }
+        }
+    }
+    return dict;
+}
 
 @end
